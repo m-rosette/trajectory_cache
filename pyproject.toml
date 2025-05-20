@@ -2,10 +2,8 @@
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.hatch.envs.default]
-dependencies = [
-    "-e external/pybullet_robokit",
-]
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [project]
 name = "trajectory_cache"
@@ -26,4 +24,5 @@ dependencies = [
     "pybullet_planning",
     "matplotlib",
     "scipy",
+    "pybullet-robokit @ git+https://github.com/m-rosette/pybullet_robokit.git@main",
 ]
