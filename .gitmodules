@@ -1,0 +1,3 @@
+[submodule "external/pybullet_robokit"]
+	path = external/pybullet_robokit
+	url = https://github.com/m-rosette/pybullet_robokit.git

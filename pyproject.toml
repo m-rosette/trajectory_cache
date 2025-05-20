@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.envs.default]
+dependencies = [
+    "-e external/pybullet_robokit",
+]
+
+[project]
+name = "trajectory_cache"
+version = "0.0.1"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Marcus Rosette", email = "rosettem@oregonstate.edu" },
+]
+maintainers = [
+    { name = "Marcus Rosette", email = "rosettem@oregonstate.edu" },
+]
+description = "Cache trajectories to highly manipulable end-effector poses"
+requires-python = ">=3.8"
+dependencies = [
+    "numpy",
+    "pybullet",
+    "pybullet_planning",
+    "matplotlib",
+    "scipy",
+]
