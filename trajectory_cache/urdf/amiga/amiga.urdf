@@ -1,0 +1,84 @@
+<?xml version="1.0"?>
+<robot name="amiga" xmlns:xacro="http://ros.org/wiki/xacro">
+    <!-- ================== -->
+    <!--     Amiga Macro    -->
+    <!-- ================== -->
+    <material name="LightLightGrey">
+        <color rgba="0.941 0.941 0.941 1.0"/>
+    </material>
+
+    <!-- ================== -->
+    <!--       Links        -->
+    <!-- ================== -->
+
+    <link name="body">
+        <!-- Base -->
+        <visual>
+            <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.0"/>
+            <geometry>
+                <mesh filename="/visual/frame_on_amiga_v2_simplified.stl"/>
+            </geometry>
+            <material name="LightLightGrey"/>
+        </visual>
+        <collision>
+            <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.0"/>
+            <geometry>
+                <mesh filename="/visual/frame_on_amiga_v2_simplified.stl"/>
+            </geometry>
+        </collision>
+        <!-- Linear Rail -->
+        <collision>
+            <origin rpy="0.0 0.0 0.0" xyz="0.0 0.29845 0.97"/>
+            <geometry>
+                <box size="1.2 0.2 0.15"/>
+            </geometry>
+        </collision>
+        <visual>
+            <origin rpy="0.0 0.0 0.0" xyz="0.0 0.29845 0.97"/>
+            <geometry>
+                <box size="1.2 0.2 0.15"/>
+            </geometry>
+        </visual>
+        <!-- Mast -->
+        <collision>
+            <origin rpy="0.0 0.0 0.0" xyz="0.57 -0.15 1.03"/>
+            <geometry>
+                <box size="0.07 0.07 0.95"/>
+            </geometry>
+        </collision>
+        <visual>
+            <origin rpy="0.0 0.0 0.0" xyz="0.57 -0.15 1.03"/>
+            <geometry>
+                <box size="0.07 0.07 0.95"/>
+            </geometry>
+        </visual>
+        <!-- GPS & Oak cameras -->
+        <collision>
+            <origin rpy="0.0 0.0 0.0" xyz="0.57 -0.15 1.6"/>
+            <geometry>
+                <box size="0.15 0.2 0.2"/>
+            </geometry>
+        </collision>
+        <visual>
+            <origin rpy="0.0 0.0 0.0" xyz="0.57 -0.15 1.6"/>
+            <geometry>
+                <box size="0.15 0.2 0.2"/>
+            </geometry>
+        </visual>
+        <!-- Amiga Brain -->
+        <collision>
+            <origin rpy="0.0 0.0 0.0" xyz="0.57 -0.315 1.25"/>
+            <geometry>
+                <box size="0.29 0.2 0.175"/>
+            </geometry>
+        </collision>
+        <visual>
+            <origin rpy="0.0 0.0 0.0" xyz="0.57 -0.315 1.25"/>
+            <geometry>
+                <box size="0.29 0.2 0.175"/>
+            </geometry>
+        </visual>
+    </link>
+
+
+</robot>

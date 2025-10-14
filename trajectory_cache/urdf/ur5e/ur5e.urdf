@@ -4,6 +4,12 @@
 <!-- |    EDITING THIS FILE BY HAND IS NOT RECOMMENDED                                 | -->
 <!-- =================================================================================== -->
 <robot name="ur5e" xmlns:xacro="http://ros.org/wiki/xacro">
+  <link name="world" />
+  <joint name="world_joint" type="fixed">
+    <parent link="world" />
+    <child link="base_link" />
+    <origin rpy="0.0 0.0 0" xyz="0.0 0.0 0.0" />
+  </joint>
   <link name="base_link">
     <visual>
       <geometry>
@@ -306,11 +312,11 @@
 
   <joint name="gripper_joint" type="fixed">
     <parent link="tool0" />
-    <child link="gripper_link" />
+    <child link="gripper_body_link" />
     <origin xyz="0 0 0.215" rpy="0 0 0" />
   </joint>
 
-  <link name="gripper_link">
+  <link name="gripper_body_link">
     <collision>
       <origin xyz="0.00 0 -0.105" rpy="0 0 0" />
       <geometry>
@@ -325,10 +331,12 @@
     </visual>
   </link>
 
-  <link name="world" />
-  <joint name="world_joint" type="fixed">
-    <parent link="world" />
-    <child link="base_link" />
-    <origin rpy="0.0 0.0 0" xyz="0.0 0.0 0.0" />
+  <joint name="eef_joint" type="fixed">
+    <parent link="gripper_body_link" />
+    <child link="gripper_link" />
+    <origin xyz="0 0 0" rpy="0 0 0" />
   </joint>
+
+  <link name="gripper_link"/>
+
 </robot>

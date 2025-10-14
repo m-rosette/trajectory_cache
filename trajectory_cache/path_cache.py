@@ -7,6 +7,7 @@ from pybullet_robokit.load_objects import LoadObjects
 from pybullet_robokit.load_robot import LoadRobot
 from pybullet_robokit.motion_planners import KinematicChainMotionPlanner
 from trajectory_cache.sample_approach_points import sample_hemisphere_suface_pts, hemisphere_orientations
+from scipy.spatial.transform import Rotation as R
 
 
 def get_data_dir(base_name: str = "data") -> Path:
@@ -27,7 +28,7 @@ def timestamped_filename(prefix: str, ext: str = "", timestamp_fmt: str = "%Y%m%
 
 
 class PathCache:
-    def __init__(self, robot_urdf_path: str, robot_home_pos, ik_tol=0.05, renders=True, ee_link_name='tool0'):
+    def __init__(self, robot_urdf_path: str, robot_home_pos, ik_tol=0.05, renders=True, ee_link_name='tool0', robot_base_ori=[0, 0, 0]):
         """ Generate a cache of paths to high scored manipulability configurations
 
         Args:
@@ -36,13 +37,19 @@ class PathCache:
         """
         self.pyb = PybUtils(renders=renders)
         self.object_loader = LoadObjects(self.pyb.con)
+        self.amiga_id = self.object_loader.load_urdf(
+            "trajectory_cache/urdf/amiga/amiga.urdf", 
+            [0, 0, 0], 
+            [0, 0, 0]
+        )
+        self.object_loader.collision_objects.append(self.amiga_id)
 
         self.robot_home_pos = robot_home_pos
         self.robot = LoadRobot(
             self.pyb.con, 
             robot_urdf_path, 
-            [0, 0, 0.05], 
-            self.pyb.con.getQuaternionFromEuler([0, 0, 0]), 
+            [-0.092075, 0.29845, 1.04775], 
+            self.pyb.con.getQuaternionFromEuler(robot_base_ori), 
             self.robot_home_pos, 
             collision_objects=self.object_loader.collision_objects,
             ee_link_name=ee_link_name)
@@ -55,6 +62,33 @@ class PathCache:
 
         # Get data directory
         self.data_dir = get_data_dir()
+
+    def show_voxels_debug_points(self, points, rgb=(1, 0.2, 0), size=4, lifetime=0.0):
+        """
+        Draw voxel centers as debug points.
+
+        Args:
+            points (np.ndarray): (N,3) array of voxel center coordinates in world frame.
+            rgb (tuple): RGB color in [0,1].
+            size (int): Pixel size of points in GUI.
+            lifetime (float): Seconds to persist; 0 -> persistent.
+        """
+        pts = np.asarray(points, dtype=float)
+        colors = np.tile(np.asarray(rgb, dtype=float), (pts.shape[0], 1))
+        # One call draws them all
+        vid = self.pyb.con.addUserDebugPoints(
+            pointPositions=pts.tolist(),
+            pointColorsRGB=colors.tolist(),
+            pointSize=size,
+            lifeTime=lifetime,
+        )
+
+        axis_length = 0.2
+        self.pyb.con.addUserDebugLine([0, 0, 0], [axis_length, 0, 0], [1, 0, 0], 3)  # X-axis (red)
+        self.pyb.con.addUserDebugLine([0, 0, 0], [0, axis_length, 0], [0, 1, 0], 3)  # Y-axis (green)
+        self.pyb.con.addUserDebugLine([0, 0, 0], [0, 0, axis_length], [0, 0, 1], 3)  # Z-axis (blue)
+        while True:
+            self.pyb.con.stepSimulation()
 
     def find_high_manip_ik(self, points, num_hemisphere_points, look_at_point_offset, hemisphere_radius, num_configs_in_path=100, save_data=True):
         """ Find the inverse kinematic solutions that result in the highest manipulability
@@ -105,19 +139,19 @@ class PathCache:
                 # If the target joint angles result in a collision with the ground plane, skip the iteration
                 ground_collision = self.robot.collision_check(self.robot.robotId, [self.object_loader.planeId])
                 if ground_collision:
-                    print('ground collision')
+                    # print('ground collision')
                     continue
 
                 # If the distance between the desired point and found ik solution ee-point is greater than the tol, then skip the iteration
                 distance = np.linalg.norm(ee_pos - target_position)
                 if distance > self.ik_tol:
-                    print('not within tol')
+                    # print('not within tol')
                     continue
 
                 # Interpolate a joint trajectory between the robot home position and the desired target configuration
                 path, collision_in_path = self.motion_planner.interpolate_joint_trajectory(robot_home_pos, joint_angles, num_steps=num_configs_in_path)
                 if collision_in_path:
-                    print('collision in path')
+                    # print('collision in path')
                     continue
 
                 manipulability = self.robot.calculate_manipulability(joint_angles)
@@ -153,12 +187,18 @@ class PathCache:
                 self.data_dir / timestamped_filename("reachable_paths", ".npy"),
                 best_paths[:, :, mask],
             )
+            np.savetxt(
+                self.data_dir / timestamped_filename("reachable_voxels", ".csv"),
+                points[mask],
+            )
 
         return nan_mask
 
             
 if __name__ == "__main__":
-    robot_home_pos = [np.pi/2, -np.pi/2, 2*np.pi/3, 5*np.pi/6, -np.pi/2, 0]
+    z_base_rotation = np.pi/4  # Rotate base of robot by 45 degrees
+
+    robot_home_pos = [z_base_rotation, -np.pi/2, 2*np.pi/3, 5*np.pi/6, -np.pi/2, 0]
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     default_urdf_dir = os.path.join(script_dir, 'urdf', 'ur5e')
@@ -166,19 +206,28 @@ if __name__ == "__main__":
 
     path_cache = PathCache(
         robot_urdf_path=default_urdf_file,
-        renders=True, 
+        renders=False, 
         robot_home_pos=robot_home_pos,
-        ee_link_name='tool0')
+        ee_link_name='gripper_link',
+        robot_base_ori=[0, 0, z_base_rotation]
+        )
 
     # Get presaved target points
-    voxel_data_filename = 'demo_voxel_data.csv'
+    voxel_data_filename = 'new_target_points.csv'
     voxel_data = np.loadtxt(os.path.join(path_cache.data_dir, voxel_data_filename))
     voxel_centers = voxel_data[:, :3]
 
-    # Translate voxels in front of robot
-    y_trans = 0.9
-    voxel_centers_shifted = np.copy(voxel_centers)
-    voxel_centers_shifted[:, 1] += y_trans
+    # Translate voxels in front of robot (compact version)
+    translation = np.array([-0.092075, 1.0, 0.5])
+    voxel_centers_shifted = voxel_centers + translation
+
+    # # visualize the voxels in PyBullet alongside the robot
+    # path_cache.show_voxels_debug_points(
+    #     voxel_centers_shifted,
+    #     rgb=(1.0, 0.4, 0.0),  # orange
+    #     size=4,
+    #     lifetime=0.0          # 0 = persist until removed/reset
+    # )
     
     # Find highest manipulable poses
     nan_mask = path_cache.find_high_manip_ik(points=voxel_centers_shifted, 
