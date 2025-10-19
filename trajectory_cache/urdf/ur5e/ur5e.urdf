@@ -313,18 +313,18 @@
   <joint name="gripper_joint" type="fixed">
     <parent link="tool0" />
     <child link="gripper_body_link" />
-    <origin xyz="0 0 0.215" rpy="0 0 0" />
+    <origin xyz="0 0 0.105" rpy="0 0 0" />
   </joint>
 
   <link name="gripper_body_link">
     <collision>
-      <origin xyz="0.00 0 -0.105" rpy="0 0 0" />
+      <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
         <box size="0.12 0.12 0.2" />
       </geometry>
     </collision>
     <visual>
-      <origin xyz="0.00 0 -0.105" rpy="0 0 0" />
+      <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
         <box size="0.12 0.12 0.2" />
       </geometry>
@@ -334,7 +334,7 @@
   <joint name="eef_joint" type="fixed">
     <parent link="gripper_body_link" />
     <child link="gripper_link" />
-    <origin xyz="0 0 0" rpy="0 0 0" />
+    <origin xyz="0 0 0.105" rpy="0 0 0" />
   </joint>
 
   <link name="gripper_link"/>

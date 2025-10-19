@@ -37,12 +37,14 @@ class PathCache:
         """
         self.pyb = PybUtils(renders=renders)
         self.object_loader = LoadObjects(self.pyb.con)
-        self.amiga_id = self.object_loader.load_urdf(
-            "trajectory_cache/urdf/amiga/amiga.urdf", 
-            [0, 0, 0], 
-            [0, 0, 0]
-        )
-        self.object_loader.collision_objects.append(self.amiga_id)
+
+        # self.amiga_id = self.object_loader.load_urdf(
+        #     "trajectory_cache/urdf/amiga/amiga.urdf", 
+        #     [0, 0, 0], 
+        #     [0, 0, 0]
+        # )
+        # self.object_loader.collision_objects.append(self.amiga_id)
+        self.temp_amiga_collision_obj_gen()
 
         self.robot_home_pos = robot_home_pos
         self.robot = LoadRobot(
@@ -62,6 +64,63 @@ class PathCache:
 
         # Get data directory
         self.data_dir = get_data_dir()
+    
+    def temp_amiga_collision_obj_gen(self):
+        slider_collision = self.pyb.con.createCollisionShape(self.pyb.con.GEOM_BOX, halfExtents=[0.6, 0.1, 0.075])
+        slider_body_id = self.pyb.con.createMultiBody(baseMass=0,
+                                baseCollisionShapeIndex=slider_collision,
+                                basePosition=[0.0, 0.29845, 0.96])
+        # --- Mast ---
+        mast_collision = self.pyb.con.createCollisionShape(
+            self.pyb.con.GEOM_BOX,
+            halfExtents=[0.035, 0.035, 0.475]
+        )
+        mast_body_id = self.pyb.con.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=mast_collision,
+            basePosition=[0.57, -0.15, 1.03]
+        )
+
+        # --- GPS & Oak cameras ---
+        gps_oak_collision = self.pyb.con.createCollisionShape(
+            self.pyb.con.GEOM_BOX,
+            halfExtents=[0.075, 0.10, 0.10]
+        )
+        gps_oak_body_id = self.pyb.con.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=gps_oak_collision,
+            basePosition=[0.57, -0.15, 1.62]
+        )
+
+        # --- Amiga Brain ---
+        brain_collision = self.pyb.con.createCollisionShape(
+            self.pyb.con.GEOM_BOX,
+            halfExtents=[0.145, 0.10, 0.0875]
+        )
+        brain_body_id = self.pyb.con.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=brain_collision,
+            basePosition=[0.57, -0.315, 1.25]
+        )
+        
+        amiga_shape = self.pyb.con.createCollisionShape(
+            shapeType=self.pyb.con.GEOM_MESH,
+            fileName="/home/marcus/manip_design_test/trajectory_cache/trajectory_cache/urdf/amiga/visual/frame_on_amiga_v2_simplified.stl",
+            flags=self.pyb.con.GEOM_FORCE_CONCAVE_TRIMESH
+        )
+        self.amiga_id = self.pyb.con.createMultiBody(
+            baseCollisionShapeIndex=amiga_shape,
+            baseVisualShapeIndex=-1,
+            basePosition=[0, 0, 0]
+        )
+        # Add all created collision objects to the loader
+        self.object_loader.collision_objects.extend([
+            self.amiga_id,
+            slider_body_id,
+            mast_body_id,
+            gps_oak_body_id,
+            brain_body_id,
+        ])
 
     def show_voxels_debug_points(self, points, rgb=(1, 0.2, 0), size=4, lifetime=0.0):
         """
@@ -137,21 +196,32 @@ class PathCache:
                 ee_pose = np.concatenate((ee_pos, ee_ori))
 
                 # If the target joint angles result in a collision with the ground plane, skip the iteration
-                ground_collision = self.robot.collision_check(self.robot.robotId, [self.object_loader.planeId])
-                if ground_collision:
-                    # print('ground collision')
+                target_config_collision = self.robot.collision_check(self.robot.robotId, self.object_loader.collision_objects)
+                if target_config_collision:
+                    # print('Collision at target config')
                     continue
 
                 # If the distance between the desired point and found ik solution ee-point is greater than the tol, then skip the iteration
                 distance = np.linalg.norm(ee_pos - target_position)
                 if distance > self.ik_tol:
-                    # print('not within tol')
+                    # print('IK solution not within IK tol')
                     continue
 
                 # Interpolate a joint trajectory between the robot home position and the desired target configuration
-                path, collision_in_path = self.motion_planner.interpolate_joint_trajectory(robot_home_pos, joint_angles, num_steps=num_configs_in_path)
-                if collision_in_path:
-                    # print('collision in path')
+                path, self_collision_in_path = self.motion_planner.interpolate_joint_trajectory(robot_home_pos, joint_angles, num_steps=num_configs_in_path)
+                if self_collision_in_path:
+                    # print('Self collision in path')
+                    continue
+
+                # Iterate over each joint configuration in the path and check for collisions with the environment
+                env_collision_in_path = False
+                for config in path:
+                    self.robot.reset_joint_positions(config)
+                    if self.robot.collision_check(self.robot.robotId, self.object_loader.collision_objects):
+                        env_collision_in_path = True
+                        # print('Environment collision in path')
+                        break
+                if env_collision_in_path:
                     continue
 
                 manipulability = self.robot.calculate_manipulability(joint_angles)
@@ -213,7 +283,7 @@ if __name__ == "__main__":
         )
 
     # Get presaved target points
-    voxel_data_filename = 'new_target_points.csv'
+    voxel_data_filename = 'test_points.csv'
     voxel_data = np.loadtxt(os.path.join(path_cache.data_dir, voxel_data_filename))
     voxel_centers = voxel_data[:, :3]
 
