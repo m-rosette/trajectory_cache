@@ -1,6 +1,7 @@
 import numpy as np
 from pathlib import Path
 import os
+import itertools
 from datetime import datetime
 from pybullet_robokit.pyb_utils import PybUtils
 from pybullet_robokit.load_objects import LoadObjects
@@ -8,6 +9,9 @@ from pybullet_robokit.load_robot import LoadRobot
 from pybullet_robokit.motion_planners import KinematicChainMotionPlanner
 from trajectory_cache.sample_approach_points import sample_hemisphere_suface_pts, hemisphere_orientations
 from scipy.spatial.transform import Rotation as R
+
+# Motion planners available to PathCache.find_high_manip_ik's `motion_planner_type` param.
+MOTION_PLANNER_TYPES = ('interpolate', 'two_stage_cartesian', 'rrt', 'approach_cartesian')
 
 
 def get_data_dir(base_name: str = "data") -> Path:
@@ -28,12 +32,15 @@ def timestamped_filename(prefix: str, ext: str = "", timestamp_fmt: str = "%Y%m%
 
 
 class PathCache:
-    def __init__(self, robot_urdf_path: str, robot_home_pos, ik_tol=0.05, renders=True, ee_link_name='tool0', robot_base_ori=[0, 0, 0]):
+    def __init__(self, robot_urdf_path: str, robot_home_pos, ik_tol=0.05, renders=True, ee_link_name='tool0',
+                 robot_base_ori=[0, 0, 0], data_dir=None):
         """ Generate a cache of paths to high scored manipulability configurations
 
         Args:
             robot_urdf_path (str): filename/path to urdf file of robot
             renders (bool, optional): visualize the robot in the PyBullet GUI. Defaults to True.
+            data_dir (str or Path, optional): directory find_high_manip_ik saves output to.
+                Defaults to None, meaning get_data_dir()'s package-relative data/ directory.
         """
         self.pyb = PybUtils(renders=renders)
         self.object_loader = LoadObjects(self.pyb.con)
@@ -62,9 +69,66 @@ class PathCache:
         self.ik_tol = ik_tol
         self.motion_planner = KinematicChainMotionPlanner(self.robot)
 
+        # Empirically estimate max reach once so find_high_manip_ik can skip points that are
+        # geometrically out of reach before running the (expensive) hemisphere IK search on them.
+        self.max_reach = self._estimate_max_reach()
+
         # Get data directory
-        self.data_dir = get_data_dir()
-    
+        if data_dir is None:
+            self.data_dir = get_data_dir()
+        else:
+            self.data_dir = Path(data_dir)
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+
+    def _estimate_max_reach(self, num_random_samples=2000, margin=1.1, corner_dof_cap=10, seed=0):
+        """ Empirically estimates the robot's max reach (end-effector distance from its base
+        position) by sampling joint configurations and taking the largest end-effector distance
+        observed, inflated by `margin`.
+
+        For a serial revolute chain, the reach boundary is usually found at or near a
+        combination of joint limit extremes, so all 2**n joint-limit "corners" are sampled
+        directly (skipped if there are more than corner_dof_cap joints, to avoid a combinatorial
+        blowup), on top of `num_random_samples` uniform-random configurations for coverage
+        in between. Since this only needs to run once and doesn't need contact info, it drives
+        PyBullet directly (bare resetJointState + getLinkState(computeForwardKinematics=True)),
+        bypassing LoadRobot.reset_joint_positions's collision-detection refresh entirely.
+
+        A margin > 1 is used deliberately: underestimating max reach would silently drop
+        genuinely-reachable points from the cache, while overestimating only costs a bit of
+        wasted search time on borderline points - the two failure modes are not symmetric.
+
+        Returns:
+            float: estimated max reach, in meters, inflated by `margin`.
+        """
+        lower = np.array(self.robot.lower_limits)
+        upper = np.array(self.robot.upper_limits)
+        n = len(lower)
+
+        configs = []
+        if n <= corner_dof_cap:
+            corners = np.array(list(itertools.product([0.0, 1.0], repeat=n)))
+            configs.append(lower + corners * (upper - lower))
+
+        rng = np.random.default_rng(seed)
+        configs.append(rng.uniform(lower, upper, size=(num_random_samples, n)))
+        configs = np.vstack(configs)
+
+        base_pos = np.array(self.robot.start_pos)
+        max_dist = 0.0
+        for config in configs:
+            for i, joint_idx in enumerate(self.robot.controllable_joint_idx):
+                self.pyb.con.resetJointState(self.robot.robotId, joint_idx, config[i])
+            link_state = self.pyb.con.getLinkState(
+                self.robot.robotId, self.robot.end_effector_index, computeForwardKinematics=True)
+            dist = np.linalg.norm(np.array(link_state[0]) - base_pos)
+            if dist > max_dist:
+                max_dist = dist
+
+        # Leave the robot at its home position for whatever search follows
+        self.robot.reset_joint_positions()
+
+        return max_dist * margin
+
     def temp_amiga_collision_obj_gen(self):
         slider_collision = self.pyb.con.createCollisionShape(self.pyb.con.GEOM_BOX, halfExtents=[0.6, 0.1, 0.075])
         slider_body_id = self.pyb.con.createMultiBody(baseMass=0,
@@ -103,9 +167,10 @@ class PathCache:
             basePosition=[0.57, -0.315, 1.25]
         )
         
+        amiga_mesh_path = Path(__file__).resolve().parent / "urdf" / "amiga" / "visual" / "frame_on_amiga_v2_simplified.stl"
         amiga_shape = self.pyb.con.createCollisionShape(
             shapeType=self.pyb.con.GEOM_MESH,
-            fileName="/home/marcus/manip_design_test/trajectory_cache/trajectory_cache/urdf/amiga/visual/frame_on_amiga_v2_simplified.stl",
+            fileName=str(amiga_mesh_path),
             flags=self.pyb.con.GEOM_FORCE_CONCAVE_TRIMESH
         )
         self.amiga_id = self.pyb.con.createMultiBody(
@@ -149,7 +214,60 @@ class PathCache:
         while True:
             self.pyb.con.stepSimulation()
 
-    def find_high_manip_ik(self, points, num_hemisphere_points, look_at_point_offset, hemisphere_radius, num_configs_in_path=100, save_data=True):
+    def _plan_trajectory(self, start_config, end_config, num_steps, collision_objects, motion_planner_type,
+                         goal_pose=None):
+        """ Dispatches to the selected motion planner and normalizes its result so that,
+        regardless of planner, a successful plan is always a (num_steps, n_joints) array.
+
+        Args:
+            start_config (array-like): starting joint configuration
+            end_config (array-like): target joint configuration. Ignored by 'approach_cartesian',
+                which plans to `goal_pose` and ends wherever its continuous path reaches that pose.
+            num_steps (int): required number of joint configurations in the returned path
+            collision_objects (list): body IDs to check the path against
+            motion_planner_type (str): one of MOTION_PLANNER_TYPES
+            goal_pose (tuple, optional): (position, quaternion) goal, required by 'approach_cartesian'
+
+        Returns:
+            path (np.ndarray or None): (num_steps, n_joints) joint trajectory, or None if
+                planning failed or the path is in collision.
+            collision_in_path (bool): True if planning failed or the path is in collision.
+        """
+        if motion_planner_type == 'interpolate':
+            path, collision_in_path = self.motion_planner.interpolate_joint_trajectory(
+                start_config, end_config, num_steps=num_steps, collision_objects=collision_objects)
+
+        elif motion_planner_type == 'two_stage_cartesian':
+            path, collision_in_path = self.motion_planner.two_stage_cartesian_path_avoid_collisions(
+                start_config, end_config, num_steps=num_steps, collision_objects=collision_objects)
+
+        elif motion_planner_type == 'approach_cartesian':
+            path, info = self.motion_planner.approach_cartesian_path(
+                start_config, goal_pose, num_steps=num_steps, collision_objects=collision_objects)
+            collision_in_path = path is None
+
+        elif motion_planner_type == 'rrt':
+            path = self.motion_planner.rrt_path(
+                start_config, end_config, collision_objects=collision_objects, steps=num_steps)
+            if path is None:
+                return None, True
+            path = np.asarray(path)
+            if path.shape[0] != num_steps:
+                # rrt_path's "start already close to goal" early exit returns an unresampled
+                # 2-waypoint path, bypassing its own `steps` resampling - normalize here.
+                path = self.motion_planner.sample_path_to_length(path, num_steps)
+            collision_in_path = False
+
+        else:
+            raise ValueError(f"Unknown motion_planner_type: {motion_planner_type!r} (expected one of {MOTION_PLANNER_TYPES})")
+
+        if collision_in_path:
+            return None, True
+        return np.asarray(path), False
+
+    def find_high_manip_ik(self, points, num_hemisphere_points, look_at_point_offset, hemisphere_radius,
+                            num_configs_in_path=100, motion_planner_type='interpolate', save_data=True,
+                            filename_tag="", verbose=True):
         """ Find the inverse kinematic solutions that result in the highest manipulability
 
         Args:
@@ -158,9 +276,30 @@ class PathCache:
             look_at_point_offset (float): distance to offset the sampled hemisphere from the target point
             hemisphere_radius (float): radius of generated hemisphere
             num_configs_in_path (int, optional): number of joint configurations within path. Defaults to 100.
-            save_data_filename (str, optional): file name/path for saving inverse kinematics data. Defaults to None.
-            path_filename (str, optional): file name/path for saving resultant paths. Defaults to None.
+            motion_planner_type (str, optional): which motion planner to use to connect the robot's
+                home position to each candidate configuration. One of MOTION_PLANNER_TYPES:
+                'interpolate' (straight joint-space interpolation), 'two_stage_cartesian' (world
+                X/Z-then-Y end-effector sweep), 'rrt' (RRT-Connect with shortcut smoothing), or
+                'approach_cartesian' (retract / traverse / straight approach along the tool axis,
+                tracked continuously; the stored IK is the path's endpoint, not the hemisphere
+                IK solution, since that may sit on a different IK branch). Every option returns exactly num_configs_in_path joint configurations when
+                successful. Defaults to 'interpolate'.
+            save_data (bool, optional): whether to save the resultant data to `self.data_dir`. Defaults to True.
+            filename_tag (str, optional): extra tag inserted into saved filenames (e.g. a worker/chunk
+                id) so concurrent callers writing to the same data_dir don't collide on the same
+                second-resolution timestamp. Defaults to "" (no tag, original filenames).
+            verbose (bool, optional): print per-point progress and the reachability pre-filter
+                summary. Defaults to True; set False when running under a parallel harness that
+                reports its own aggregate progress instead. Defaults to True.
+
+        Returns:
+            list[Path] | None: the three saved file paths (csv, npy, csv) if save_data=True,
+                else None.
         """
+        if motion_planner_type not in MOTION_PLANNER_TYPES:
+            raise ValueError(f"Unknown motion_planner_type: {motion_planner_type!r} (expected one of {MOTION_PLANNER_TYPES})")
+
+        points = np.asarray(points)
         num_points = len(points)
 
         # Initialize arrays for saving data
@@ -170,12 +309,33 @@ class PathCache:
         best_manipulabilities = np.zeros((num_points, 1))
         best_paths = np.zeros((num_configs_in_path, len(self.robot.controllable_joint_idx), num_points))
 
-        nan_mask = None
-        increment = 0.05  # 5% print increment
+        # Reachability pre-filter: a hemisphere sample can land up to hemisphere_radius closer to
+        # the base than the voxel itself (and the hemisphere is centered look_at_point_offset away
+        # from it), so a point only has any chance of a valid IK solution if it's within
+        # max_reach + that slack. Skipping the full hemisphere search for points that fail this is
+        # the cheapest possible rejection - one norm per point instead of up to
+        # num_hemisphere_points IK solves each.
+        robot_base_pos = np.array(self.robot.start_pos)
+        reach_slack = hemisphere_radius + abs(look_at_point_offset)
+        in_reach = np.linalg.norm(points - robot_base_pos, axis=1) <= (self.max_reach + reach_slack)
+        if verbose:
+            print(f"Reachability pre-filter: {in_reach.sum()}/{num_points} points within reach "
+                  f"({num_points - in_reach.sum()} skipped, max_reach={self.max_reach:.3f}m)")
+
+        # increment*num_points can floor to 0 for num_points < 20, which would divide by zero below
+        print_every = max(1, int(0.05 * num_points))  # ~5% print increment
 
         for i, pt in enumerate(points):
-            if i % int(increment * num_points) == 0:
+            if verbose and i % print_every == 0:
                 print(f"{np.round(i / num_points, 2) * 100}% Complete")
+
+            if not in_reach[i]:
+                best_iks[i, :] = np.nan
+                best_ee_positions[i, :] = np.nan
+                best_orienations[i, :] = np.nan
+                best_manipulabilities[i, :] = np.nan
+                best_paths[:, :, i] = np.nan
+                continue
 
             # Sample target points
             hemisphere_pts = sample_hemisphere_suface_pts(pt, look_at_point_offset, hemisphere_radius, num_hemisphere_points)
@@ -187,64 +347,90 @@ class PathCache:
             best_manipulability = 0
             best_path = None
 
-            # Get IK solution for each target point on hemisphere and save the one with the highest manipulability 
+            # Collect every hemisphere sample with a valid, collision-free IK solution
+            candidates = []
             for target_position, target_orientation in zip(hemisphere_pts, hemisphere_oris):
-                joint_angles = self.robot.inverse_kinematics((target_position, target_orientation))
+                # inverse_kinematics already checks self- and environment-collision internally
+                # (retrying with a perturbed rest config on failure) and leaves the robot reset
+                # to the returned joint_angles, so no separate reset/collision check is needed here.
+                joint_angles, collision_free = self.robot.inverse_kinematics(
+                    (target_position, target_orientation),
+                    collision_objects=self.object_loader.collision_objects,
+                    return_status=True,
+                )
+                # 'approach_cartesian' checks reachability and collision along its own continuous
+                # path, and the global IK solution here may sit on a different IK branch than that
+                # path reaches - so a failed global solve doesn't rule the pose out, it's only used
+                # to rank candidates.
+                if motion_planner_type != 'approach_cartesian':
+                    if not collision_free:
+                        # print('Collision at target config')
+                        continue
 
-                self.robot.reset_joint_positions(joint_angles)
-                ee_pos, ee_ori = self.robot.get_link_state(self.robot.end_effector_index)
-                ee_pose = np.concatenate((ee_pos, ee_ori))
+                    ee_pos, _ = self.robot.get_link_state(self.robot.end_effector_index)
 
-                # If the target joint angles result in a collision with the ground plane, skip the iteration
-                target_config_collision = self.robot.collision_check(self.robot.robotId, self.object_loader.collision_objects)
-                if target_config_collision:
-                    # print('Collision at target config')
-                    continue
-
-                # If the distance between the desired point and found ik solution ee-point is greater than the tol, then skip the iteration
-                distance = np.linalg.norm(ee_pos - target_position)
-                if distance > self.ik_tol:
-                    # print('IK solution not within IK tol')
-                    continue
-
-                # Interpolate a joint trajectory between the robot home position and the desired target configuration
-                path, self_collision_in_path = self.motion_planner.interpolate_joint_trajectory(robot_home_pos, joint_angles, num_steps=num_configs_in_path)
-                if self_collision_in_path:
-                    # print('Self collision in path')
-                    continue
-
-                # Iterate over each joint configuration in the path and check for collisions with the environment
-                env_collision_in_path = False
-                for config in path:
-                    self.robot.reset_joint_positions(config)
-                    if self.robot.collision_check(self.robot.robotId, self.object_loader.collision_objects):
-                        env_collision_in_path = True
-                        # print('Environment collision in path')
-                        break
-                if env_collision_in_path:
-                    continue
+                    # If the distance between the desired point and found ik solution ee-point is greater than the tol, then skip the iteration
+                    distance = np.linalg.norm(ee_pos - target_position)
+                    if distance > self.ik_tol:
+                        # print('IK solution not within IK tol')
+                        continue
 
                 manipulability = self.robot.calculate_manipulability(joint_angles)
-                if manipulability > best_manipulability:
-                    best_path = path
-                    best_ik = joint_angles
-                    best_ee_pos = target_position
-                    best_orienation = target_orientation
-                    best_manipulability = manipulability
+                candidates.append((manipulability, joint_angles, target_position, target_orientation))
 
-            best_iks[i, :] = best_ik
-            best_ee_positions[i, :] = best_ee_pos
-            best_orienations[i, :] = best_orienation
-            best_manipulabilities[i, :] = best_manipulability
-            best_paths[:, :, i] = best_path
-        
+            # Plan paths in descending manipulability order and keep the first that succeeds.
+            # Path planning dominates the cost, so this plans as few candidates as possible.
+            candidates.sort(key=lambda c: c[0], reverse=True)
+            for manipulability, joint_angles, target_position, target_orientation in candidates:
+                # Plan a joint trajectory between the robot home position and the desired target
+                # configuration using the selected motion planner; always num_configs_in_path long.
+                path, collision_in_path = self._plan_trajectory(
+                    self.robot_home_pos, joint_angles, num_configs_in_path,
+                    self.object_loader.collision_objects, motion_planner_type,
+                    goal_pose=(target_position, target_orientation),
+                )
+                if collision_in_path:
+                    continue
+
+                if motion_planner_type == 'approach_cartesian':
+                    # The continuous path defines the goal configuration
+                    joint_angles = path[-1]
+                    manipulability = self.robot.calculate_manipulability(joint_angles)
+
+                best_path = path
+                best_ik = joint_angles
+                best_ee_pos = target_position
+                best_orienation = target_orientation
+                best_manipulability = manipulability
+                break
+
+            if best_ik is None:
+                # No hemisphere sample for this point produced a collision-free IK solution with
+                # a collision-free path - mark the row NaN so the mask below drops it, instead of
+                # crashing on `best_iks[i, :] = None`.
+                best_iks[i, :] = np.nan
+                best_ee_positions[i, :] = np.nan
+                best_orienations[i, :] = np.nan
+                best_manipulabilities[i, :] = np.nan
+                best_paths[:, :, i] = np.nan
+            else:
+                best_iks[i, :] = best_ik
+                best_ee_positions[i, :] = best_ee_pos
+                best_orienations[i, :] = best_orienation
+                best_manipulabilities[i, :] = best_manipulability
+                best_paths[:, :, i] = best_path
+
         # Stack & filter
         combined = np.hstack((best_iks, best_ee_positions, best_orienations, best_manipulabilities))
         mask = ~np.isnan(combined).any(axis=1) 
 
         if save_data:
+            # filename_tag disambiguates concurrent callers (e.g. parallel workers) writing to the
+            # same data_dir within the same second-resolution timestamp.
+            tag_suffix = f"_{filename_tag}" if filename_tag else ""
+
             # End-effector CSV
-            csv_path = self.data_dir / timestamped_filename("voxel_ik_data", ".csv")
+            csv_path = self.data_dir / timestamped_filename(f"voxel_ik_data{tag_suffix}", ".csv")
             np.savetxt(
                 csv_path,
                 combined[mask],
@@ -253,16 +439,15 @@ class PathCache:
                 comments="",
             )
             # Paths NPY
-            np.save(
-                self.data_dir / timestamped_filename("reachable_paths", ".npy"),
-                best_paths[:, :, mask],
-            )
-            np.savetxt(
-                self.data_dir / timestamped_filename("reachable_voxels", ".csv"),
-                points[mask],
-            )
+            paths_path = self.data_dir / timestamped_filename(f"reachable_paths{tag_suffix}", ".npy")
+            np.save(paths_path, best_paths[:, :, mask])
 
-        return nan_mask
+            voxels_path = self.data_dir / timestamped_filename(f"reachable_voxels{tag_suffix}", ".csv")
+            np.savetxt(voxels_path, points[mask])
+
+            return [csv_path, paths_path, voxels_path]
+
+        return None
 
             
 if __name__ == "__main__":
@@ -283,7 +468,7 @@ if __name__ == "__main__":
         )
 
     # Get presaved target points
-    voxel_data_filename = 'test_points.csv'
+    voxel_data_filename = '/home/marcus/imml/trajectory_cache/data/voxel_data_parallelepiped.csv'
     voxel_data = np.loadtxt(os.path.join(path_cache.data_dir, voxel_data_filename))
     voxel_centers = voxel_data[:, :3]
 
@@ -300,8 +485,11 @@ if __name__ == "__main__":
     # )
     
     # Find highest manipulable poses
-    nan_mask = path_cache.find_high_manip_ik(points=voxel_centers_shifted, 
-                                             num_hemisphere_points=[10, 10], 
-                                             look_at_point_offset=0.0, 
-                                             hemisphere_radius=0.15, 
-                                             num_configs_in_path=100)
+    # motion_planner_type selects how each path to a candidate configuration is planned;
+    # see MOTION_PLANNER_TYPES ('interpolate', 'two_stage_cartesian', 'rrt', 'approach_cartesian').
+    saved_paths = path_cache.find_high_manip_ik(points=voxel_centers_shifted,
+                                             num_hemisphere_points=[16, 16],
+                                             look_at_point_offset=0.0,
+                                             hemisphere_radius=0.10,
+                                             num_configs_in_path=100,
+                                             motion_planner_type='interpolate')
