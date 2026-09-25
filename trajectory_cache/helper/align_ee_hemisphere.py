@@ -113,6 +113,7 @@ def main():
     samples = []
     print(f"\n{'#':>3}  {'off +y':>7}  {'elev':>6}  {'yaw':>6}  {'IK err':>7}  {'manip':>7}  status")
     for i, (position, orientation) in enumerate(zip(pts, oris)):
+        robot.reset_joint_positions(ROBOT_HOME_POS)  # seed from home, as find_high_manip_ik does
         joint_angles, collision_free = robot.inverse_kinematics((position, orientation),
                                                                 collision_objects=collision_objects,
                                                                 return_status=True)
