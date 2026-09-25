@@ -267,7 +267,7 @@ class PathCache:
 
     def find_high_manip_ik(self, points, num_hemisphere_points, look_at_point_offset, hemisphere_radius,
                             num_configs_in_path=100, motion_planner_type='interpolate', save_data=True,
-                            filename_tag="", verbose=True):
+                            filename_tag="", verbose=True, max_wrist_roll=np.pi/2):
         """ Find the inverse kinematic solutions that result in the highest manipulability
 
         Args:
@@ -291,6 +291,11 @@ class PathCache:
             verbose (bool, optional): print per-point progress and the reachability pre-filter
                 summary. Defaults to True; set False when running under a parallel harness that
                 reports its own aggregate progress instead. Defaults to True.
+            max_wrist_roll (float, optional): max |wrist_3 - home wrist_3| (rad) an IK solution may
+                have. Candidates beyond this sit on a wrist-flipped IK branch (or a 2*pi wrap) and
+                would spin the wrist on the way from home, so they're skipped. Not wrapped to
+                [-pi, pi] on purpose, since joint-space planners travel the raw difference.
+                Defaults to pi/2.
 
         Returns:
             list[Path] | None: the three saved file paths (csv, npy, csv) if save_data=True,
@@ -350,6 +355,12 @@ class PathCache:
             # Collect every hemisphere sample with a valid, collision-free IK solution
             candidates = []
             for target_position, target_orientation in zip(hemisphere_pts, hemisphere_oris):
+                # PyBullet's IK seeds from the robot's current joint state, and inverse_kinematics
+                # leaves the robot at the previous candidate's solution - so without this reset a
+                # wrist-flipped branch (wrist_2 sign flip, wrist_3 ~180 deg from home) carries over
+                # from one sample to the next. Seeding every solve from home keeps it on home's branch.
+                self.robot.reset_joint_positions(self.robot_home_pos)
+
                 # inverse_kinematics already checks self- and environment-collision internally
                 # (retrying with a perturbed rest config on failure) and leaves the robot reset
                 # to the returned joint_angles, so no separate reset/collision check is needed here.
@@ -358,6 +369,12 @@ class PathCache:
                     collision_objects=self.object_loader.collision_objects,
                     return_status=True,
                 )
+
+                # Reject solutions whose wrist would have to spin around to reach the goal (e.g. a
+                # collision retry that still landed on the flipped branch)
+                wrist_roll_from_home = np.abs(joint_angles[-1] - self.robot_home_pos[-1])
+                if wrist_roll_from_home > max_wrist_roll:
+                    continue
                 # 'approach_cartesian' checks reachability and collision along its own continuous
                 # path, and the global IK solution here may sit on a different IK branch than that
                 # path reaches - so a failed global solve doesn't rule the pose out, it's only used
