@@ -11,7 +11,7 @@ from trajectory_cache.sample_approach_points import sample_hemisphere_suface_pts
 from scipy.spatial.transform import Rotation as R
 
 # Motion planners available to PathCache.find_high_manip_ik's `motion_planner_type` param.
-MOTION_PLANNER_TYPES = ('interpolate', 'two_stage_cartesian', 'rrt', 'approach_cartesian')
+MOTION_PLANNER_TYPES = ('interpolate', 'two_stage_cartesian', 'rrt', 'approach_cartesian', 'hybrid_approach')
 
 
 def get_data_dir(base_name: str = "data") -> Path:
@@ -227,6 +227,7 @@ class PathCache:
             collision_objects (list): body IDs to check the path against
             motion_planner_type (str): one of MOTION_PLANNER_TYPES
             goal_pose (tuple, optional): (position, quaternion) goal, required by 'approach_cartesian'
+                and 'hybrid_approach'
 
         Returns:
             path (np.ndarray or None): (num_steps, n_joints) joint trajectory, or None if
@@ -244,6 +245,11 @@ class PathCache:
         elif motion_planner_type == 'approach_cartesian':
             path, info = self.motion_planner.approach_cartesian_path(
                 start_config, goal_pose, num_steps=num_steps, collision_objects=collision_objects)
+            collision_in_path = path is None
+
+        elif motion_planner_type == 'hybrid_approach':
+            path, info = self.motion_planner.hybrid_approach_path(
+                start_config, end_config, goal_pose, num_steps=num_steps, collision_objects=collision_objects)
             collision_in_path = path is None
 
         elif motion_planner_type == 'rrt':
@@ -267,7 +273,7 @@ class PathCache:
 
     def find_high_manip_ik(self, points, num_hemisphere_points, look_at_point_offset, hemisphere_radius,
                             num_configs_in_path=100, motion_planner_type='interpolate', save_data=True,
-                            filename_tag="", verbose=True, max_wrist_roll=np.pi/2):
+                            filename_tag="", verbose=True, max_wrist_roll=np.pi/2, ik_seed_configs=None):
         """ Find the inverse kinematic solutions that result in the highest manipulability
 
         Args:
@@ -282,8 +288,10 @@ class PathCache:
                 X/Z-then-Y end-effector sweep), 'rrt' (RRT-Connect with shortcut smoothing), or
                 'approach_cartesian' (retract / traverse / straight approach along the tool axis,
                 tracked continuously; the stored IK is the path's endpoint, not the hemisphere
-                IK solution, since that may sit on a different IK branch). Every option returns exactly num_configs_in_path joint configurations when
-                successful. Defaults to 'interpolate'.
+                IK solution, since that may sit on a different IK branch), or 'hybrid_approach'
+                (joint-space transit to a straight approach along the tool axis, ending at the
+                ranked IK solution). Every option returns exactly num_configs_in_path joint
+                configurations when successful. Defaults to 'interpolate'.
             save_data (bool, optional): whether to save the resultant data to `self.data_dir`. Defaults to True.
             filename_tag (str, optional): extra tag inserted into saved filenames (e.g. a worker/chunk
                 id) so concurrent callers writing to the same data_dir don't collide on the same
@@ -296,6 +304,9 @@ class PathCache:
                 would spin the wrist on the way from home, so they're skipped. Not wrapped to
                 [-pi, pi] on purpose, since joint-space planners travel the raw difference.
                 Defaults to pi/2.
+            ik_seed_configs (list of array-like, optional): extra IK seeds, tried in order after the
+                home position until one gives a usable solution. Paths still start at home.
+                Defaults to None (home only).
 
         Returns:
             list[Path] | None: the three saved file paths (csv, npy, csv) if save_data=True,
@@ -327,6 +338,8 @@ class PathCache:
             print(f"Reachability pre-filter: {in_reach.sum()}/{num_points} points within reach "
                   f"({num_points - in_reach.sum()} skipped, max_reach={self.max_reach:.3f}m)")
 
+        ik_seeds = [self.robot_home_pos] + [list(q) for q in (ik_seed_configs or [])]
+
         # increment*num_points can floor to 0 for num_points < 20, which would divide by zero below
         print_every = max(1, int(0.05 * num_points))  # ~5% print increment
 
@@ -355,45 +368,43 @@ class PathCache:
             # Collect every hemisphere sample with a valid, collision-free IK solution
             candidates = []
             for target_position, target_orientation in zip(hemisphere_pts, hemisphere_oris):
-                # PyBullet's IK seeds from the robot's current joint state, and inverse_kinematics
-                # leaves the robot at the previous candidate's solution - so without this reset a
-                # wrist-flipped branch (wrist_2 sign flip, wrist_3 ~180 deg from home) carries over
-                # from one sample to the next. Seeding every solve from home keeps it on home's branch.
-                self.robot.reset_joint_positions(self.robot_home_pos)
+                for seed in ik_seeds:
+                    # PyBullet's IK seeds from the current joint state; reset so a wrist-flipped
+                    # solution from the previous sample doesn't carry over
+                    self.robot.reset_joint_positions(seed)
 
-                # inverse_kinematics already checks self- and environment-collision internally
-                # (retrying with a perturbed rest config on failure) and leaves the robot reset
-                # to the returned joint_angles, so no separate reset/collision check is needed here.
-                joint_angles, collision_free = self.robot.inverse_kinematics(
-                    (target_position, target_orientation),
-                    collision_objects=self.object_loader.collision_objects,
-                    return_status=True,
-                )
+                    # inverse_kinematics checks self- and environment-collision internally
+                    joint_angles, collision_free = self.robot.inverse_kinematics(
+                        (target_position, target_orientation),
+                        collision_objects=self.object_loader.collision_objects,
+                        return_status=True,
+                    )
 
-                # Reject solutions whose wrist would have to spin around to reach the goal (e.g. a
-                # collision retry that still landed on the flipped branch)
-                wrist_roll_from_home = np.abs(joint_angles[-1] - self.robot_home_pos[-1])
-                if wrist_roll_from_home > max_wrist_roll:
-                    continue
-                # 'approach_cartesian' checks reachability and collision along its own continuous
-                # path, and the global IK solution here may sit on a different IK branch than that
-                # path reaches - so a failed global solve doesn't rule the pose out, it's only used
-                # to rank candidates.
-                if motion_planner_type != 'approach_cartesian':
-                    if not collision_free:
-                        # print('Collision at target config')
+                    # Reject solutions whose wrist would have to spin around to reach the goal
+                    wrist_roll_from_home = np.abs(joint_angles[-1] - self.robot_home_pos[-1])
+                    if wrist_roll_from_home > max_wrist_roll:
                         continue
+                    # 'approach_cartesian' checks collision along its own path, which may end on a
+                    # different IK branch, so the global solution is only used for ranking
+                    if motion_planner_type != 'approach_cartesian':
+                        if not collision_free:
+                            continue
 
-                    ee_pos, _ = self.robot.get_link_state(self.robot.end_effector_index)
+                        ee_pos, _ = self.robot.get_link_state(self.robot.end_effector_index)
+                        if np.linalg.norm(ee_pos - target_position) > self.ik_tol:
+                            continue
 
-                    # If the distance between the desired point and found ik solution ee-point is greater than the tol, then skip the iteration
-                    distance = np.linalg.norm(ee_pos - target_position)
-                    if distance > self.ik_tol:
-                        # print('IK solution not within IK tol')
-                        continue
+                        if motion_planner_type == 'hybrid_approach':
+                            # 'hybrid_approach' ends at this exact configuration, so refine it first
+                            joint_angles, converged = self.motion_planner.refine_ik(
+                                joint_angles, (target_position, target_orientation))
+                            if not converged or not self.motion_planner.same_ik_branch(
+                                    self.robot_home_pos, joint_angles):
+                                continue
 
-                manipulability = self.robot.calculate_manipulability(joint_angles)
-                candidates.append((manipulability, joint_angles, target_position, target_orientation))
+                    manipulability = self.robot.calculate_manipulability(joint_angles)
+                    candidates.append((manipulability, joint_angles, target_position, target_orientation))
+                    break
 
             # Plan paths in descending manipulability order and keep the first that succeeds.
             # Path planning dominates the cost, so this plans as few candidates as possible.
@@ -409,7 +420,7 @@ class PathCache:
                 if collision_in_path:
                     continue
 
-                if motion_planner_type == 'approach_cartesian':
+                if motion_planner_type in ('approach_cartesian', 'hybrid_approach'):
                     # The continuous path defines the goal configuration
                     joint_angles = path[-1]
                     manipulability = self.robot.calculate_manipulability(joint_angles)
@@ -503,7 +514,7 @@ if __name__ == "__main__":
     
     # Find highest manipulable poses
     # motion_planner_type selects how each path to a candidate configuration is planned;
-    # see MOTION_PLANNER_TYPES ('interpolate', 'two_stage_cartesian', 'rrt', 'approach_cartesian').
+    # see MOTION_PLANNER_TYPES.
     saved_paths = path_cache.find_high_manip_ik(points=voxel_centers_shifted,
                                              num_hemisphere_points=[16, 16],
                                              look_at_point_offset=0.0,

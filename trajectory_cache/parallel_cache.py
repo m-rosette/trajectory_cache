@@ -1,7 +1,11 @@
 import argparse
 import atexit
+import ctypes
+import multiprocessing
 import numpy as np
 import os
+import signal
+import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -42,9 +46,41 @@ def select_center_points(points, fraction):
     return points[keep]
 
 
+def _init_worker(parent_pid):
+    """ Worker initializer: ignores SIGINT and restores default SIGTERM so the parent alone handles
+    shutdown (ProcessPoolExecutor would otherwise swallow the exception and move to the next chunk).
+    On Linux, also asks the kernel to kill this worker if the parent dies. """
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    try:
+        PR_SET_PDEATHSIG = 1
+        ctypes.CDLL(None, use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+    except (OSError, AttributeError):
+        pass
+    if os.getppid() != parent_pid:  # parent already died before prctl took effect
+        os._exit(1)
+
+
+def _raise_keyboard_interrupt(signum, frame):
+    """ Parent SIGTERM handler, so kill/scancel take the same cleanup path as Ctrl-C. """
+    raise KeyboardInterrupt(f"received {signal.Signals(signum).name}")
+
+
+def _terminate_workers(timeout=5.0):
+    """ Terminates all child processes, escalating to SIGKILL after `timeout` seconds. """
+    children = multiprocessing.active_children()
+    for child in children:
+        child.terminate()
+    for child in children:
+        child.join(timeout)
+        if child.is_alive():
+            child.kill()
+            child.join()
+
+
 def _process_chunk(chunk_id, points_chunk, robot_urdf_path, robot_home_pos, ik_tol, ee_link_name,
                     robot_base_ori, num_hemisphere_points, look_at_point_offset, hemisphere_radius,
-                    num_configs_in_path, motion_planner_type, data_dir):
+                    num_configs_in_path, motion_planner_type, data_dir, ik_seed_configs=None):
     """ Runs in a worker process: builds its own PathCache (own PyBullet DIRECT client, own robot,
     own collision environment - nothing is shared with the parent or other workers) and searches
     its assigned chunk of points. Must be a top-level function (not a method/closure) so it can be
@@ -84,6 +120,7 @@ def _process_chunk(chunk_id, points_chunk, robot_urdf_path, robot_home_pos, ik_t
             save_data=True,
             filename_tag=f"w{chunk_id:04d}",
             verbose=False,
+            ik_seed_configs=ik_seed_configs,
         )
     finally:
         path_cache.pyb.disconnect()
@@ -153,7 +190,7 @@ def merge_outputs(chunk_results, data_dir):
 def run_parallel(points, robot_urdf_path, robot_home_pos, num_hemisphere_points, look_at_point_offset,
                   hemisphere_radius, num_configs_in_path=100, motion_planner_type='interpolate',
                   ik_tol=0.05, ee_link_name='tool0', robot_base_ori=[0, 0, 0], num_workers=6,
-                  chunk_size=200, data_dir=None, seed=0):
+                  chunk_size=200, data_dir=None, seed=0, ik_seed_configs=None):
     """ Splits points across num_workers processes, each running its own independent PathCache
     search, then merges every chunk's output into one combined result.
 
@@ -169,6 +206,8 @@ def run_parallel(points, robot_urdf_path, robot_home_pos, num_hemisphere_points,
     expensive tree searches can dominate a chunk's runtime) - consider chunk_size ~50-100 for rrt
     vs ~200-300 for interpolate/two_stage_cartesian.
 
+    ik_seed_configs is passed through to PathCache.find_high_manip_ik.
+
     Returns:
         tuple[Path, Path, Path]: merged (voxel_ik_data csv, reachable_paths npy, reachable_voxels csv)
     """
@@ -181,20 +220,37 @@ def run_parallel(points, robot_urdf_path, robot_home_pos, num_hemisphere_points,
           f"across {num_workers} workers, writing to {run_dir}")
 
     results = []
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = {
-            executor.submit(
+    # Not a `with` block: its shutdown(wait=True) would run every remaining chunk on Ctrl-C
+    executor = ProcessPoolExecutor(max_workers=num_workers, initializer=_init_worker,
+                                   initargs=(os.getpid(),))
+    previous_sigterm_handler = signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
+    futures = []
+    try:
+        for chunk_id, chunk in enumerate(chunks):
+            futures.append(executor.submit(
                 _process_chunk, chunk_id, chunk, robot_urdf_path, robot_home_pos, ik_tol,
                 ee_link_name, robot_base_ori, num_hemisphere_points, look_at_point_offset,
-                hemisphere_radius, num_configs_in_path, motion_planner_type, run_dir,
-            ): chunk_id
-            for chunk_id, chunk in enumerate(chunks)
-        }
+                hemisphere_radius, num_configs_in_path, motion_planner_type, run_dir, ik_seed_configs,
+            ))
         for future in as_completed(futures):
             result = future.result()
             results.append(result)
             print(f"[{len(results)}/{len(chunks)} chunks done] "
                   f"chunk {result['chunk_id']}: {result['n_points']} points in {result['elapsed']:.1f}s")
+    except BaseException:
+        # Ctrl-C, SIGTERM, or a failed chunk: cancel queued chunks and kill running ones.
+        # (Not shutdown(cancel_futures=True), which needs Python 3.9+.)
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=False)
+        _terminate_workers()
+        print(f"Stopped after {len(results)}/{len(chunks)} chunks; completed chunk files are in {run_dir}",
+              file=sys.stderr)
+        raise
+    else:
+        executor.shutdown(wait=True)
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm_handler)
 
     print("Merging chunk outputs...")
     merged = merge_outputs(results, run_dir)
@@ -206,9 +262,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Parallel PathCache.find_high_manip_ik runner")
     parser.add_argument('--motion-planner-type', choices=MOTION_PLANNER_TYPES, default='interpolate',
                          help="Motion planner used to connect the robot's home position to each "
-                              "candidate configuration. 'approach_cartesian' is the only option that "
-                              "guarantees a continuous joint path. 'rrt' is far slower and much higher-"
-                              "variance than the others - consider a smaller --chunk-size with it.")
+                              "candidate configuration. 'approach_cartesian' and 'hybrid_approach' "
+                              "guarantee a continuous joint path on the home IK branch; "
+                              "'hybrid_approach' reaches more of the workspace. 'rrt' is far slower "
+                              "and much higher-variance than the others - consider a smaller "
+                              "--chunk-size with it.")
     parser.add_argument('--num-workers', type=int, default=6,
                          help="Worker processes. This machine has 8 physical cores; the default "
                               "leaves 2 free for the OS/interactive use.")
@@ -239,6 +297,8 @@ if __name__ == "__main__":
     z_base_rotation = np.pi / 4  # Rotate base of robot by 45 degrees
     # robot_home_pos = [z_base_rotation, -np.pi / 2, 2 * np.pi / 3, 5 * np.pi / 6, -np.pi / 2, 0]
     robot_home_pos = [z_base_rotation, -2.755, 1.72, 4.71, -1.58, 0]
+    # Extra IK seed on home's elbow/wrist branch, for low targets whose IK solutions near home collide
+    ik_seed_configs = [[z_base_rotation, -np.pi / 2, 2 * np.pi / 3, 5 * np.pi / 6, -np.pi / 2, 0]]
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     default_urdf_file = os.path.join(script_dir, 'urdf', 'ur5e', 'ur5e.urdf')
@@ -271,4 +331,5 @@ if __name__ == "__main__":
         chunk_size=args.chunk_size,
         data_dir=data_dir,
         seed=args.seed,
+        ik_seed_configs=ik_seed_configs,
     )
