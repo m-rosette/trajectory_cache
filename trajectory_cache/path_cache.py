@@ -62,7 +62,8 @@ class PathCache:
             self.robot_home_pos, 
             collision_objects=self.object_loader.collision_objects,
             ee_link_name=ee_link_name)
-        
+        self._disable_rigid_tool_collisions()
+
         start_position, start_orientation = self.robot.get_link_state(self.robot.end_effector_index)
         self.start_pose = np.concatenate((start_position, start_orientation))
 
@@ -79,6 +80,22 @@ class PathCache:
         else:
             self.data_dir = Path(data_dir)
             self.data_dir.mkdir(parents=True, exist_ok=True)
+
+    def _disable_rigid_tool_collisions(self, link_names=('wrist_3_link', 'hose_mount_clip_link', 'gripper_body_link')):
+        """ Disables self-collision between every pair of links rigidly mounted at the wrist flange.
+
+        PyBullet's URDF_USE_SELF_COLLISION only skips direct parent-child pairs, but the tool links
+        hang off tool0 (no collision geometry), so they are grandchildren of wrist_3_link and siblings
+        of each other - their pairs stay enabled. The gripper mesh sits flush on the flange, so
+        wrist_3_link <-> gripper_body_link would otherwise report contact in every configuration and
+        reject every IK solution. Link names missing from the URDF are skipped.
+        """
+        con = self.pyb.con
+        name_to_idx = {con.getJointInfo(self.robot.robotId, j)[12].decode(): j
+                       for j in range(self.robot.num_joints)}
+        idxs = [name_to_idx[name] for name in link_names if name in name_to_idx]
+        for link_a, link_b in itertools.combinations(idxs, 2):
+            self.robot.disable_collision_pair(link_a, link_b)
 
     def _estimate_max_reach(self, num_random_samples=2000, margin=1.1, corner_dof_cap=10, seed=0):
         """ Empirically estimates the robot's max reach (end-effector distance from its base
