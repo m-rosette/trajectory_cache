@@ -10,7 +10,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-from trajectory_cache.path_cache import PathCache, get_data_dir, timestamped_filename, MOTION_PLANNER_TYPES
+from trajectory_cache.path_cache import PathCache, get_data_dir, timestamped_filename, MOTION_PLANNER_TYPES, BASE_TYPES, BASE_Z_ROTATIONS, ROBOT_BASE_ORI_Z
 
 
 def build_chunks(points, chunk_size, seed=0):
@@ -80,7 +80,8 @@ def _terminate_workers(timeout=5.0):
 
 def _process_chunk(chunk_id, points_chunk, robot_urdf_path, robot_home_pos, ik_tol, ee_link_name,
                     robot_base_ori, num_hemisphere_points, look_at_point_offset, hemisphere_radius,
-                    num_configs_in_path, motion_planner_type, data_dir, ik_seed_configs=None):
+                    num_configs_in_path, motion_planner_type, data_dir, ik_seed_configs=None,
+                    base_type='amiga'):
     """ Runs in a worker process: builds its own PathCache (own PyBullet DIRECT client, own robot,
     own collision environment - nothing is shared with the parent or other workers) and searches
     its assigned chunk of points. Must be a top-level function (not a method/closure) so it can be
@@ -107,6 +108,7 @@ def _process_chunk(chunk_id, points_chunk, robot_urdf_path, robot_home_pos, ik_t
         ee_link_name=ee_link_name,
         robot_base_ori=robot_base_ori,
         data_dir=data_dir,
+        base_type=base_type,
     )
 
     try:
@@ -190,7 +192,7 @@ def merge_outputs(chunk_results, data_dir):
 def run_parallel(points, robot_urdf_path, robot_home_pos, num_hemisphere_points, look_at_point_offset,
                   hemisphere_radius, num_configs_in_path=100, motion_planner_type='interpolate',
                   ik_tol=0.05, ee_link_name='tool0', robot_base_ori=[0, 0, 0], num_workers=6,
-                  chunk_size=200, data_dir=None, seed=0, ik_seed_configs=None):
+                  chunk_size=200, data_dir=None, seed=0, ik_seed_configs=None, base_type='amiga'):
     """ Splits points across num_workers processes, each running its own independent PathCache
     search, then merges every chunk's output into one combined result.
 
@@ -206,7 +208,8 @@ def run_parallel(points, robot_urdf_path, robot_home_pos, num_hemisphere_points,
     expensive tree searches can dominate a chunk's runtime) - consider chunk_size ~50-100 for rrt
     vs ~200-300 for interpolate/two_stage_cartesian.
 
-    ik_seed_configs is passed through to PathCache.find_high_manip_ik.
+    ik_seed_configs is passed through to PathCache.find_high_manip_ik, and base_type (the robot
+    mount, see BASE_TYPES) to every worker's PathCache.
 
     Returns:
         tuple[Path, Path, Path]: merged (voxel_ik_data csv, reachable_paths npy, reachable_voxels csv)
@@ -231,6 +234,7 @@ def run_parallel(points, robot_urdf_path, robot_home_pos, num_hemisphere_points,
                 _process_chunk, chunk_id, chunk, robot_urdf_path, robot_home_pos, ik_tol,
                 ee_link_name, robot_base_ori, num_hemisphere_points, look_at_point_offset,
                 hemisphere_radius, num_configs_in_path, motion_planner_type, run_dir, ik_seed_configs,
+                base_type,
             ))
         for future in as_completed(futures):
             result = future.result()
@@ -267,6 +271,9 @@ def parse_args():
                               "'hybrid_approach' reaches more of the workspace. 'rrt' is far slower "
                               "and much higher-variance than the others - consider a smaller "
                               "--chunk-size with it.")
+    parser.add_argument('--base-type', choices=BASE_TYPES, default='amiga',
+                         help="Robot mount: selects which base collision objects are loaded and "
+                              "where the robot base is placed on them.")
     parser.add_argument('--num-workers', type=int, default=6,
                          help="Worker processes. This machine has 8 physical cores; the default "
                               "leaves 2 free for the OS/interactive use.")
@@ -298,7 +305,10 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
 
-    z_base_rotation = np.pi / 4  # Rotate base of robot by 45 degrees
+    z_base_rotation = BASE_Z_ROTATIONS[args.base_type]  # Robot base rotation on this mount
+    robot_base_ori_z = ROBOT_BASE_ORI_Z[args.base_type]  # Robot base frame rotation on this mount
+    print(f"Base type: {args.base_type} (z_base_rotation = {z_base_rotation:.4f} rad, "
+          f"robot_base_ori z = {robot_base_ori_z:.4f} rad)")
     # robot_home_pos = [z_base_rotation, -np.pi / 2, 2 * np.pi / 3, 5 * np.pi / 6, -np.pi / 2, 0]
     robot_home_pos = [z_base_rotation, -2.755, 1.72, 4.71, -1.58, -0.523599]
     # Extra IK seed on home's elbow/wrist branch, for low targets whose IK solutions near home collide
@@ -333,10 +343,11 @@ if __name__ == "__main__":
         num_configs_in_path=100,
         motion_planner_type=args.motion_planner_type,
         ee_link_name='gripper_link',
-        robot_base_ori=[0, 0, z_base_rotation],
+        robot_base_ori=[0, 0, robot_base_ori_z],
         num_workers=args.num_workers,
         chunk_size=args.chunk_size,
         data_dir=data_dir,
         seed=args.seed,
         ik_seed_configs=ik_seed_configs,
+        base_type=args.base_type,
     )

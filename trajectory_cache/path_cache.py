@@ -13,6 +13,24 @@ from scipy.spatial.transform import Rotation as R
 # Motion planners available to PathCache.find_high_manip_ik's `motion_planner_type` param.
 MOTION_PLANNER_TYPES = ('interpolate', 'two_stage_cartesian', 'rrt', 'approach_cartesian', 'hybrid_approach')
 
+# Robot mounts available to PathCache's `base_type` param. Each loads only its own collision
+# objects and places the robot base on top of that mount.
+# BASE_Z_ROTATIONS: z_base_rotation (rad) on that mount, used as the first joint of robot_home_pos
+# and the IK seeds.
+BASE_Z_ROTATIONS = {
+    'amiga': np.pi / 4,  # Rotate base of robot by 45 degrees
+    'cart': 0,
+    'field_table': 0,
+}
+BASE_TYPES = tuple(BASE_Z_ROTATIONS)
+
+# ROBOT_BASE_ORI_Z: z rotation (rad) of the robot base frame on that mount, used for robot_base_ori.
+ROBOT_BASE_ORI_Z = {
+    'amiga': np.pi / 4,
+    'cart': np.pi / 2,
+    'field_table': np.pi / 2,
+}
+
 
 def get_data_dir(base_name: str = "data") -> Path:
     """
@@ -33,7 +51,7 @@ def timestamped_filename(prefix: str, ext: str = "", timestamp_fmt: str = "%Y%m%
 
 class PathCache:
     def __init__(self, robot_urdf_path: str, robot_home_pos, ik_tol=0.05, renders=True, ee_link_name='tool0',
-                 robot_base_ori=[0, 0, 0], data_dir=None):
+                 robot_base_ori=[0, 0, 0], data_dir=None, base_type='amiga'):
         """ Generate a cache of paths to high scored manipulability configurations
 
         Args:
@@ -41,23 +59,37 @@ class PathCache:
             renders (bool, optional): visualize the robot in the PyBullet GUI. Defaults to True.
             data_dir (str or Path, optional): directory find_high_manip_ik saves output to.
                 Defaults to None, meaning get_data_dir()'s package-relative data/ directory.
+            base_type (str, optional): robot mount, one of BASE_TYPES. Selects which collision
+                objects are loaded and where the robot base sits on them. Defaults to 'amiga'.
         """
+        if base_type not in BASE_TYPES:
+            raise ValueError(f"Unknown base_type {base_type!r}; expected one of {BASE_TYPES}")
+        self.base_type = base_type
+
         self.pyb = PybUtils(renders=renders)
         self.object_loader = LoadObjects(self.pyb.con)
 
-        # self.amiga_id = self.object_loader.load_urdf(
-        #     "trajectory_cache/urdf/amiga/amiga.urdf", 
-        #     [0, 0, 0], 
-        #     [0, 0, 0]
-        # )
-        # self.object_loader.collision_objects.append(self.amiga_id)
-        self.temp_amiga_collision_obj_gen()
+        if base_type == "amiga":
+            # self.amiga_id = self.object_loader.load_urdf(
+            #     "trajectory_cache/urdf/amiga/amiga.urdf", 
+            #     [0, 0, 0], 
+            #     [0, 0, 0]
+            # )
+            # self.object_loader.collision_objects.append(self.amiga_id)
+            self.temp_amiga_collision_obj_gen()
+            ur_to_base_translation = [0.0, 0.306, 1.041]
+        elif base_type == "cart":
+            self.temp_cart_collision_obj_gen()
+            ur_to_base_translation = [0.0, -0.1, 0.857 + 0.006]  # 6mm clearance above the wood mount, as on the Amiga
+        elif base_type == "field_table":
+            self.temp_field_table_collision_obj_gen()
+            ur_to_base_translation = [0.0, -0.1, 0.86519 + 0.006]  # 6mm clearance above the table, as on the Amiga
 
         self.robot_home_pos = robot_home_pos
         self.robot = LoadRobot(
             self.pyb.con, 
             robot_urdf_path, 
-            [0.0, 0.306, 1.041], 
+            ur_to_base_translation, 
             self.pyb.con.getQuaternionFromEuler(robot_base_ori), 
             self.robot_home_pos, 
             collision_objects=self.object_loader.collision_objects,
@@ -205,6 +237,50 @@ class PathCache:
             gps_oak_body_id,
             brain_body_id,
         ])
+
+    def temp_cart_collision_obj_gen(self):
+        # --- Wood mount ---
+        wood_mount_collision = self.pyb.con.createCollisionShape(
+            self.pyb.con.GEOM_BOX,
+            halfExtents=[0.355, 0.155, 0.052/2]
+        )
+        wood_mount_body_id = self.pyb.con.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=wood_mount_collision,
+            basePosition=[0, -0.1, 0.83]
+        )
+        
+        # --- Cart ---
+        cart_collision = self.pyb.con.createCollisionShape(
+            self.pyb.con.GEOM_BOX,
+            halfExtents=[0.355, 0.255, 0.4025]
+        )
+        cart_body_id = self.pyb.con.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=cart_collision,
+            basePosition=[0, 0, 0.4025]
+        )
+
+        # Add all created collision objects to the loader
+        self.object_loader.collision_objects.extend([
+            wood_mount_body_id,
+            cart_body_id,
+        ])
+
+    def temp_field_table_collision_obj_gen(self):
+        # --- Field table ---
+        field_table_collision = self.pyb.con.createCollisionShape(
+            self.pyb.con.GEOM_BOX,
+            halfExtents=[0.8763/2, 0.55404/2, 0.86519/2]
+        )
+        field_table_body_id = self.pyb.con.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=field_table_collision,
+            basePosition=[0, 0, 0.86519/2]
+        )
+
+        # Add all created collision objects to the loader
+        self.object_loader.collision_objects.append(field_table_body_id)
 
     def show_voxels_debug_points(self, points, rgb=(1, 0.2, 0), size=4, lifetime=0.0):
         """
@@ -498,7 +574,8 @@ class PathCache:
 
             
 if __name__ == "__main__":
-    z_base_rotation = np.pi/4  # Rotate base of robot by 45 degrees
+    base_type = 'amiga'  # Change this to 'amiga' or 'cart' as needed
+    z_base_rotation = BASE_Z_ROTATIONS[base_type]
 
     robot_home_pos = [z_base_rotation, -np.pi/2, 2*np.pi/3, 5*np.pi/6, -np.pi/2, -0.523599]
 
@@ -508,10 +585,11 @@ if __name__ == "__main__":
 
     path_cache = PathCache(
         robot_urdf_path=default_urdf_file,
-        renders=False, 
+        renders=True, 
         robot_home_pos=robot_home_pos,
         ee_link_name='gripper_link',
-        robot_base_ori=[0, 0, z_base_rotation]
+        robot_base_ori=[0, 0, ROBOT_BASE_ORI_Z[base_type]],
+        base_type=base_type,
         )
 
     # Get presaved target points
@@ -520,23 +598,23 @@ if __name__ == "__main__":
     voxel_centers = voxel_data[:, :3]
 
     # Translate voxels in front of robot (compact version)
-    translation = np.array([0.0, 1.0, 10.5])
+    translation = np.array([0.0, 1.0, 0.5])
     voxel_centers_shifted = voxel_centers + translation
 
-    # # visualize the voxels in PyBullet alongside the robot
-    # path_cache.show_voxels_debug_points(
-    #     voxel_centers_shifted,
-    #     rgb=(1.0, 0.4, 0.0),  # orange
-    #     size=4,
-    #     lifetime=0.0          # 0 = persist until removed/reset
-    # )
+    # visualize the voxels in PyBullet alongside the robot
+    path_cache.show_voxels_debug_points(
+        voxel_centers_shifted,
+        rgb=(1.0, 0.4, 0.0),  # orange
+        size=4,
+        lifetime=0.0          # 0 = persist until removed/reset
+    )
     
-    # Find highest manipulable poses
-    # motion_planner_type selects how each path to a candidate configuration is planned;
-    # see MOTION_PLANNER_TYPES.
-    saved_paths = path_cache.find_high_manip_ik(points=voxel_centers_shifted,
-                                             num_hemisphere_points=[16, 16],
-                                             look_at_point_offset=0.0,
-                                             hemisphere_radius=0.20,
-                                             num_configs_in_path=100,
-                                             motion_planner_type='interpolate')
+    # # Find highest manipulable poses
+    # # motion_planner_type selects how each path to a candidate configuration is planned;
+    # # see MOTION_PLANNER_TYPES.
+    # saved_paths = path_cache.find_high_manip_ik(points=voxel_centers_shifted,
+    #                                          num_hemisphere_points=[16, 16],
+    #                                          look_at_point_offset=0.0,
+    #                                          hemisphere_radius=0.20,
+    #                                          num_configs_in_path=100,
+    #                                          motion_planner_type='interpolate')

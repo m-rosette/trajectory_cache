@@ -26,12 +26,12 @@ import time
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-from trajectory_cache.path_cache import PathCache
+from trajectory_cache.path_cache import PathCache, BASE_TYPES, BASE_Z_ROTATIONS, ROBOT_BASE_ORI_Z
 from trajectory_cache.sample_approach_points import sample_hemisphere_suface_pts, hemisphere_orientations
 
-# Match parallel_cache.py's __main__ setup
-Z_BASE_ROTATION = np.pi / 4
-ROBOT_HOME_POS = [Z_BASE_ROTATION, -np.pi / 2, 2 * np.pi / 3, 5 * np.pi / 6, -np.pi / 2, 0]
+# Match parallel_cache.py's __main__ setup. The home pose's first joint comes from BASE_Z_ROTATIONS
+# and robot_base_ori from ROBOT_BASE_ORI_Z, for the chosen --base-type.
+ROBOT_HOME_POS_AFTER_BASE = [-np.pi / 2, 2 * np.pi / 3, 5 * np.pi / 6, -np.pi / 2, 0]
 VOXEL_TRANSLATION = np.array([-0.092075, 1.0, 0.5])
 ANGLE_THRESHOLD = np.pi / 6  # sample_hemisphere_suface_pts' default, passed explicitly so the drawn cone matches
 
@@ -54,6 +54,8 @@ def parse_args():
     parser.add_argument('--voxel-file', default=DEFAULT_VOXEL_FILE,
                         help="Voxel centers CSV used for --voxel-index / the default target.")
     parser.add_argument('--ee-link', default='gripper_link', help="End-effector link (default: gripper_link).")
+    parser.add_argument('--base-type', choices=BASE_TYPES, default='amiga',
+                        help="Robot mount whose collision objects are loaded (default: amiga).")
     return parser.parse_args()
 
 
@@ -90,8 +92,12 @@ def main():
     args = parse_args()
     target = resolve_target(args)
 
-    path_cache = PathCache(robot_urdf_path=DEFAULT_URDF, robot_home_pos=ROBOT_HOME_POS, renders=True,
-                           ee_link_name=args.ee_link, robot_base_ori=[0, 0, Z_BASE_ROTATION])
+    z_base_rotation = BASE_Z_ROTATIONS[args.base_type]
+    robot_home_pos = [z_base_rotation] + ROBOT_HOME_POS_AFTER_BASE
+    path_cache = PathCache(robot_urdf_path=DEFAULT_URDF, robot_home_pos=robot_home_pos, renders=True,
+                           ee_link_name=args.ee_link,
+                           robot_base_ori=[0, 0, ROBOT_BASE_ORI_Z[args.base_type]],
+                           base_type=args.base_type)
     con, robot = path_cache.pyb.con, path_cache.robot
     collision_objects = path_cache.object_loader.collision_objects
 
@@ -113,7 +119,7 @@ def main():
     samples = []
     print(f"\n{'#':>3}  {'off +y':>7}  {'elev':>6}  {'yaw':>6}  {'IK err':>7}  {'manip':>7}  status")
     for i, (position, orientation) in enumerate(zip(pts, oris)):
-        robot.reset_joint_positions(ROBOT_HOME_POS)  # seed from home, as find_high_manip_ik does
+        robot.reset_joint_positions(robot_home_pos)  # seed from home, as find_high_manip_ik does
         joint_angles, collision_free = robot.inverse_kinematics((position, orientation),
                                                                 collision_objects=collision_objects,
                                                                 return_status=True)
