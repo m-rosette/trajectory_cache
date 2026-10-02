@@ -81,14 +81,16 @@ class PathCache:
             self.data_dir = Path(data_dir)
             self.data_dir.mkdir(parents=True, exist_ok=True)
 
-    def _disable_rigid_tool_collisions(self, link_names=('wrist_3_link', 'hose_mount_clip_link', 'gripper_body_link')):
+    def _disable_rigid_tool_collisions(self, link_names=('wrist_3_link', 'hose_mount_clip_link', 'gripper_body_link',
+                                                          'gripper_link', 'ejector_link')):
         """ Disables self-collision between every pair of links rigidly mounted at the wrist flange.
 
         PyBullet's URDF_USE_SELF_COLLISION only skips direct parent-child pairs, but the tool links
         hang off tool0 (no collision geometry), so they are grandchildren of wrist_3_link and siblings
         of each other - their pairs stay enabled. The gripper mesh sits flush on the flange, so
         wrist_3_link <-> gripper_body_link would otherwise report contact in every configuration and
-        reject every IK solution. Link names missing from the URDF are skipped.
+        reject every IK solution. The defaults cover both ur5e.urdf (Finray gripper) and
+        ur5e_suction.urdf (suction gripper + ejector plate). Link names missing from the URDF are skipped.
         """
         con = self.pyb.con
         name_to_idx = {con.getJointInfo(self.robot.robotId, j)[12].decode(): j

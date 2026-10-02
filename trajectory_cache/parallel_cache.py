@@ -276,6 +276,10 @@ def parse_args():
                               "setup overhead (~0.3s/chunk, negligible at these scales).")
     parser.add_argument('--voxel-file', default='/home/marcus/imml/trajectory_cache/data/voxel_data_parallelepiped.csv',
                          help="Path to the voxel centers CSV (first 3 columns are x,y,z).")
+    parser.add_argument('--urdf', default='ur5e.urdf',
+                         help="Robot URDF (selects the end-effector): a filename in the package's "
+                              "urdf/ur5e/ directory, e.g. 'ur5e.urdf' (Finray gripper) or "
+                              "'ur5e_suction.urdf' (suction gripper), or a path to a URDF.")
     parser.add_argument('--data-dir', default=None,
                          help="Parent directory each run's timestamped run_<YYYYMMDD_HHMMSS>/ "
                               "subdirectory (holding that run's chunk and merged files) is created "
@@ -301,7 +305,10 @@ if __name__ == "__main__":
     ik_seed_configs = [[z_base_rotation, -np.pi / 2, 2 * np.pi / 3, 5 * np.pi / 6, -np.pi / 2, 0]]
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    default_urdf_file = os.path.join(script_dir, 'urdf', 'ur5e', 'ur5e.urdf')
+    urdf_file = args.urdf if os.path.isfile(args.urdf) else os.path.join(script_dir, 'urdf', 'ur5e', args.urdf)
+    if not os.path.isfile(urdf_file):
+        sys.exit(f"URDF not found: {args.urdf}")
+    print(f"Using URDF: {urdf_file}")
 
     data_dir = get_data_dir() if args.data_dir is None else args.data_dir
     voxel_data = np.loadtxt(args.voxel_file)
@@ -318,7 +325,7 @@ if __name__ == "__main__":
 
     run_parallel(
         points=voxel_centers_shifted,
-        robot_urdf_path=default_urdf_file,
+        robot_urdf_path=urdf_file,
         robot_home_pos=robot_home_pos,
         num_hemisphere_points=[16, 16],
         look_at_point_offset=0.0,
