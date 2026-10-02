@@ -57,7 +57,7 @@ class PathCache:
         self.robot = LoadRobot(
             self.pyb.con, 
             robot_urdf_path, 
-            [-0.092075, 0.29845, 1.04775], 
+            [0.0, 0.306, 1.041], 
             self.pyb.con.getQuaternionFromEuler(robot_base_ori), 
             self.robot_home_pos, 
             collision_objects=self.object_loader.collision_objects,
@@ -500,7 +500,7 @@ class PathCache:
 if __name__ == "__main__":
     z_base_rotation = np.pi/4  # Rotate base of robot by 45 degrees
 
-    robot_home_pos = [z_base_rotation, -np.pi/2, 2*np.pi/3, 5*np.pi/6, -np.pi/2, 0]
+    robot_home_pos = [z_base_rotation, -np.pi/2, 2*np.pi/3, 5*np.pi/6, -np.pi/2, -0.523599]
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     default_urdf_dir = os.path.join(script_dir, 'urdf', 'ur5e')
@@ -520,7 +520,7 @@ if __name__ == "__main__":
     voxel_centers = voxel_data[:, :3]
 
     # Translate voxels in front of robot (compact version)
-    translation = np.array([-0.092075, 1.0, 0.5])
+    translation = np.array([0.0, 1.0, 10.5])
     voxel_centers_shifted = voxel_centers + translation
 
     # # visualize the voxels in PyBullet alongside the robot
@@ -537,6 +537,6 @@ if __name__ == "__main__":
     saved_paths = path_cache.find_high_manip_ik(points=voxel_centers_shifted,
                                              num_hemisphere_points=[16, 16],
                                              look_at_point_offset=0.0,
-                                             hemisphere_radius=0.10,
+                                             hemisphere_radius=0.20,
                                              num_configs_in_path=100,
                                              motion_planner_type='interpolate')

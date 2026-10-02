@@ -300,9 +300,9 @@ if __name__ == "__main__":
 
     z_base_rotation = np.pi / 4  # Rotate base of robot by 45 degrees
     # robot_home_pos = [z_base_rotation, -np.pi / 2, 2 * np.pi / 3, 5 * np.pi / 6, -np.pi / 2, 0]
-    robot_home_pos = [z_base_rotation, -2.755, 1.72, 4.71, -1.58, 0]
+    robot_home_pos = [z_base_rotation, -2.755, 1.72, 4.71, -1.58, -0.523599]
     # Extra IK seed on home's elbow/wrist branch, for low targets whose IK solutions near home collide
-    ik_seed_configs = [[z_base_rotation, -np.pi / 2, 2 * np.pi / 3, 5 * np.pi / 6, -np.pi / 2, 0]]
+    ik_seed_configs = [[z_base_rotation, -np.pi / 2, 2 * np.pi / 3, 5 * np.pi / 6, -np.pi / 2, -0.523599]]
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     urdf_file = args.urdf if os.path.isfile(args.urdf) else os.path.join(script_dir, 'urdf', 'ur5e', args.urdf)
@@ -314,7 +314,7 @@ if __name__ == "__main__":
     voxel_data = np.loadtxt(args.voxel_file)
     voxel_centers = voxel_data[:, :3]
 
-    translation = np.array([-0.092075, 1.0, 0.5])
+    translation = np.array([0, 1.0, 0.5])
     voxel_centers_shifted = voxel_centers + translation
 
     if args.center_fraction is not None:
@@ -329,7 +329,7 @@ if __name__ == "__main__":
         robot_home_pos=robot_home_pos,
         num_hemisphere_points=[16, 16],
         look_at_point_offset=0.0,
-        hemisphere_radius=0.10,
+        hemisphere_radius=0.20,
         num_configs_in_path=100,
         motion_planner_type=args.motion_planner_type,
         ee_link_name='gripper_link',
